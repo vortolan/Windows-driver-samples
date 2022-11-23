@@ -21,6 +21,8 @@ Environment:
 #include <strsafe.h>
 #include <sys\sioctl.h>
 
+#include <conio.h>
+
 
 BOOLEAN
 ManageDriver(
@@ -35,8 +37,8 @@ SetupDriverName(
     _In_ ULONG BufferLength
     );
 
-char OutputBuffer[100];
-char InputBuffer[100];
+char OutputBuffer[16 * 1024];
+char InputBuffer[1024];
 
 VOID __cdecl
 main(
@@ -126,6 +128,40 @@ main(
                         sizeof(InputBuffer));
     printf("OutputBuffer Pointer = %p BufLength = %Iu\n", OutputBuffer,
                                 sizeof(OutputBuffer));
+
+    //
+    // Performing METHOD_BUFFERED Process list
+    //
+
+
+    StringCbCopy(InputBuffer, sizeof(InputBuffer),
+        "Hey, get me the list of running processes please!");
+
+    printf("\nCalling DeviceIoControl METHOD_BUFFERED_PROCESS_LIST:\n");
+
+    memset(OutputBuffer, 0, sizeof(OutputBuffer));
+
+    bRc = DeviceIoControl(hDevice,
+        (DWORD)IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED,
+        &InputBuffer,
+        (DWORD)strlen(InputBuffer) + 1,
+        &OutputBuffer,
+        sizeof(OutputBuffer),
+        &bytesReturned,
+        NULL
+    );
+
+    if (!bRc)
+    {
+        printf("Error in DeviceIoControl : %d", GetLastError());
+        return;
+
+    }
+    
+    _getch();
+    wprintf(L"OutBuffer (%d): %s\n", bytesReturned, (WCHAR*) OutputBuffer);
+    _getch();
+
     //
     // Performing METHOD_BUFFERED
     //

@@ -25,9 +25,12 @@ Environment:
 //
 
 #include <ntddk.h>          // various NT definitions
-#include <string.h>
-
 #include "sioctl.h"
+#include "winternl-defs.h"
+#include <ntstrsafe.h>
+#include <wdm.h>
+
+
 
 #define NT_DEVICE_NAME      L"\\Device\\SIOCTL"
 #define DOS_DEVICE_NAME     L"\\DosDevices\\IoctlTest"
@@ -282,6 +285,7 @@ Return Value:
     NTSTATUS            ntStatus = STATUS_SUCCESS;// Assume success
     ULONG               inBufLength; // Input buffer length
     ULONG               outBufLength; // Output buffer length
+    
     PCHAR               inBuf, outBuf; // pointer to Input and output buffer
     PCHAR               data = "This String is from Device Driver !!!";
     size_t              datalen = strlen(data)+1;//Length of data including null
@@ -308,6 +312,64 @@ Return Value:
 
     switch ( irpSp->Parameters.DeviceIoControl.IoControlCode )
     {
+    case IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED:
+
+        //Debug info
+        SIOCTL_KDPRINT(("Called IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED\n"));
+        PrintIrpInfo(Irp);
+
+        //Set buffers
+        inBuf = Irp->AssociatedIrp.SystemBuffer;
+        outBuf = Irp->AssociatedIrp.SystemBuffer;
+
+        //Print data incoming
+        SIOCTL_KDPRINT(("\tData from User :"));
+        PrintChars(inBuf, inBufLength);
+        
+        //Allocate buffer to store process names
+        USHORT PROCESS_NAMES_SIZE = 1024 * 16;
+        UNICODE_STRING processes_names = { 0 };
+        processes_names.Length = 0;
+        processes_names.Buffer = (PWCHAR) ExAllocatePool2(POOL_FLAG_PAGED, PROCESS_NAMES_SIZE, '9gaT');
+        processes_names.MaximumLength = PROCESS_NAMES_SIZE;
+
+        UNICODE_STRING comma;
+        RtlInitUnicodeString(&comma, L",");
+
+        UNICODE_STRING nullstr;
+        RtlInitUnicodeString(&nullstr, L"\0");
+
+        //Perform actual query
+        int SPI_BUFFER_SIZE = 1 * 1024 * 1024;
+        PVOID spi_buffer = ExAllocatePool2(POOL_FLAG_PAGED, SPI_BUFFER_SIZE, '9gaT');
+        if (spi_buffer) {
+            PSYSTEM_PROCESS_INFORMATION pspi = (PSYSTEM_PROCESS_INFORMATION) spi_buffer;
+            if (NT_SUCCESS(ZwQuerySystemInformation(SystemProcessInformation, pspi, SPI_BUFFER_SIZE, NULL))) {
+
+                while (pspi->NextEntryOffset) {
+                    if (pspi->ImageName.Length) {
+                        RtlAppendUnicodeStringToString(&processes_names, &pspi->ImageName);
+                        RtlAppendUnicodeStringToString(&processes_names, &comma);
+                    }
+                    pspi = (PSYSTEM_PROCESS_INFORMATION)((PUCHAR)pspi + pspi->NextEntryOffset);
+                }
+
+                //Copy data to out buffer and print
+                RtlAppendUnicodeStringToString(&processes_names, &nullstr);
+                RtlCopyMemory(outBuf, processes_names.Buffer, processes_names.Length * sizeof(WCHAR));
+
+                //Free memory
+                ExFreePoolWithTag(spi_buffer, '9gaT');
+                ExFreePoolWithTag(processes_names.Buffer, '9gaT');
+
+                Irp->IoStatus.Information = processes_names.Length < outBufLength ? 
+                    processes_names.Length : outBufLength;
+            }
+        }
+        
+        
+        break;
+
     case IOCTL_SIOCTL_METHOD_BUFFERED:
 
         //
@@ -344,7 +406,7 @@ Return Value:
         // Write to the buffer over-writes the input buffer content
         //
 
-        RtlCopyBytes(outBuf, data, outBufLength);
+        RtlCopyBytes(outBuf, data, datalen);
 
         SIOCTL_KDPRINT(("\tData to User : "));
         PrintChars(outBuf, datalen  );
@@ -539,7 +601,7 @@ Return Value:
         // Write to the buffer
         //
 
-        RtlCopyBytes(buffer, data, outBufLength);
+        RtlCopyBytes(buffer, data, datalen);
 
         SIOCTL_KDPRINT(("\tData to User : %s\n", buffer));
         PrintChars(buffer, datalen);
@@ -652,7 +714,7 @@ Return Value:
         // Write data to be sent to the user in this buffer
         //
 
-        RtlCopyBytes(buffer, data, outBufLength);
+        RtlCopyBytes(buffer, data, datalen);
 
         SIOCTL_KDPRINT(("\tData to User : "));
         PrintChars(buffer, datalen);
