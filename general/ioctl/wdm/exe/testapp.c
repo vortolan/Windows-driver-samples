@@ -110,7 +110,7 @@ main(
                             0,
                             NULL,
                             CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL,
+                            FILE_FLAG_OVERLAPPED,
                             NULL);
 
         if ( hDevice == INVALID_HANDLE_VALUE ){
@@ -129,11 +129,30 @@ main(
     printf("OutputBuffer Pointer = %p BufLength = %Iu\n", OutputBuffer,
                                 sizeof(OutputBuffer));
 
+    //Send a lot of IRP inverted call
+    //OVERLAPPED
+    //THEN wait for multiple objects on the OVERLAPPED structs
+    OVERLAPPED overlapped_handles[10];
+
+    for (int i = 0; i < sizeof(overlapped_handles) / sizeof(overlapped_handles[0]); ++i) {
+        memset(OutputBuffer, 0, sizeof(OutputBuffer));
+
+        bRc = DeviceIoControl(hDevice,
+            (DWORD)IOCTL_SIOCTL_INVERTED_CALL,
+            &InputBuffer,
+            (DWORD)strlen(InputBuffer) + 1,
+            &OutputBuffer,
+            sizeof(OutputBuffer),
+            &bytesReturned,
+            &overlapped_handles[i]
+        );
+    }
+
     //
     // Performing METHOD_BUFFERED Process list
     //
 
-
+    OVERLAPPED process_list_overlapped;
     StringCbCopy(InputBuffer, sizeof(InputBuffer),
         "Hey, get me the list of running processes please!");
 
@@ -148,7 +167,7 @@ main(
         &OutputBuffer,
         sizeof(OutputBuffer),
         &bytesReturned,
-        NULL
+        &process_list_overlapped
     );
 
     if (!bRc)
@@ -158,123 +177,7 @@ main(
 
     }
     
-    _getch();
     wprintf(L"OutBuffer (%d): %s\n", bytesReturned, (WCHAR*) OutputBuffer);
-    _getch();
-
-    //
-    // Performing METHOD_BUFFERED
-    //
-
-    StringCbCopy(InputBuffer, sizeof(InputBuffer),
-        "This String is from User Application; using METHOD_BUFFERED");
-
-    printf("\nCalling DeviceIoControl METHOD_BUFFERED:\n");
-
-    memset(OutputBuffer, 0, sizeof(OutputBuffer));
-
-    bRc = DeviceIoControl ( hDevice,
-                            (DWORD) IOCTL_SIOCTL_METHOD_BUFFERED,
-                            &InputBuffer,
-                            (DWORD) strlen ( InputBuffer )+1,
-                            &OutputBuffer,
-                            sizeof( OutputBuffer),
-                            &bytesReturned,
-                            NULL
-                            );
-
-    if ( !bRc )
-    {
-        printf ( "Error in DeviceIoControl : %d", GetLastError());
-        return;
-
-    }
-    printf("    OutBuffer (%d): %s\n", bytesReturned, OutputBuffer);
-
-    //
-    // Performing METHOD_NEITHER
-    //
-
-    printf("\nCalling DeviceIoControl METHOD_NEITHER\n");
-
-    StringCbCopy(InputBuffer, sizeof(InputBuffer),
-               "This String is from User Application; using METHOD_NEITHER");
-    memset(OutputBuffer, 0, sizeof(OutputBuffer));
-
-    bRc = DeviceIoControl ( hDevice,
-                            (DWORD) IOCTL_SIOCTL_METHOD_NEITHER,
-                            &InputBuffer,
-                            (DWORD) strlen ( InputBuffer )+1,
-                            &OutputBuffer,
-                            sizeof( OutputBuffer),
-                            &bytesReturned,
-                            NULL
-                            );
-
-    if ( !bRc )
-    {
-        printf ( "Error in DeviceIoControl : %d\n", GetLastError());
-        return;
-
-    }
-
-    printf("    OutBuffer (%d): %s\n", bytesReturned, OutputBuffer);
-
-    //
-    // Performing METHOD_IN_DIRECT
-    //
-
-    printf("\nCalling DeviceIoControl METHOD_IN_DIRECT\n");
-
-    StringCbCopy(InputBuffer, sizeof(InputBuffer),
-               "This String is from User Application; using METHOD_IN_DIRECT");
-    StringCbCopy(OutputBuffer, sizeof(OutputBuffer),
-               "This String is from User Application in OutBuffer; using METHOD_IN_DIRECT");
-
-    bRc = DeviceIoControl ( hDevice,
-                            (DWORD) IOCTL_SIOCTL_METHOD_IN_DIRECT,
-                            &InputBuffer,
-                            (DWORD) strlen ( InputBuffer )+1,
-                            &OutputBuffer,
-                            sizeof( OutputBuffer),
-                            &bytesReturned,
-                            NULL
-                            );
-
-    if ( !bRc )
-    {
-        printf ( "Error in DeviceIoControl : %d", GetLastError());
-        return;
-    }
-
-    printf("    Number of bytes transfered from OutBuffer: %d\n",
-                                    bytesReturned);
-
-    //
-    // Performing METHOD_OUT_DIRECT
-    //
-
-    printf("\nCalling DeviceIoControl METHOD_OUT_DIRECT\n");
-    StringCbCopy(InputBuffer, sizeof(InputBuffer),
-               "This String is from User Application; using METHOD_OUT_DIRECT");
-    memset(OutputBuffer, 0, sizeof(OutputBuffer));
-    bRc = DeviceIoControl ( hDevice,
-                            (DWORD) IOCTL_SIOCTL_METHOD_OUT_DIRECT,
-                            &InputBuffer,
-                            (DWORD) strlen ( InputBuffer )+1,
-                            &OutputBuffer,
-                            sizeof( OutputBuffer),
-                            &bytesReturned,
-                            NULL
-                            );
-
-    if ( !bRc )
-    {
-        printf ( "Error in DeviceIoControl : %d", GetLastError());
-        return;
-    }
-
-    printf("    OutBuffer (%d): %s\n", bytesReturned, OutputBuffer);
 
     CloseHandle ( hDevice );
 
@@ -288,9 +191,7 @@ main(
                  );
 
 
-    //
-    // close the handle to the device.
-    //
+    _getch();
 
 }
 

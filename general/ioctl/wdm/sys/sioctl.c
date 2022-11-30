@@ -30,7 +30,7 @@ Environment:
 #include <ntstrsafe.h>
 #include <wdm.h>
 
-
+#include "structures.h"
 
 #define NT_DEVICE_NAME      L"\\Device\\SIOCTL"
 #define DOS_DEVICE_NAME     L"\\DosDevices\\IoctlTest"
@@ -50,9 +50,14 @@ Environment:
 
 DRIVER_INITIALIZE DriverEntry;
 
-_Dispatch_type_(IRP_MJ_CREATE)
 _Dispatch_type_(IRP_MJ_CLOSE)
-DRIVER_DISPATCH SioctlCreateClose;
+DRIVER_DISPATCH SioctlClose;
+
+_Dispatch_type_(IRP_MJ_CREATE)
+DRIVER_DISPATCH SioctlCreate;
+
+_Dispatch_type_(IRP_MJ_CLEANUP)
+DRIVER_DISPATCH SioctlCleanup;
 
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH SioctlDeviceControl;
@@ -69,9 +74,14 @@ PrintChars(
     _In_ size_t CountChars
     );
 
+VOID
+ProcessRegularIrps(PVOID DriverObject);
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text( INIT, DriverEntry )
-#pragma alloc_text( PAGE, SioctlCreateClose)
+#pragma alloc_text( PAGE, SioctlCreate)
+#pragma alloc_text( PAGE, SioctlClose)
+#pragma alloc_text( PAGE, SioctlCleanup)
 #pragma alloc_text( PAGE, SioctlDeviceControl)
 #pragma alloc_text( PAGE, SioctlUnloadDriver)
 #pragma alloc_text( PAGE, PrintIrpInfo)
@@ -83,27 +93,7 @@ NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT   DriverObject,
     _In_ PUNICODE_STRING      RegistryPath
-    )
-/*++
-
-Routine Description:
-    This routine is called by the Operating System to initialize the driver.
-
-    It creates the device object, fills in the dispatch entry points and
-    completes the initialization.
-
-Arguments:
-    DriverObject - a pointer to the object that represents this device
-    driver.
-
-    RegistryPath - a pointer to our Services key in the registry.
-
-Return Value:
-    STATUS_SUCCESS if initialized; an error otherwise.
-
---*/
-
-{
+    ) {
     NTSTATUS        ntStatus;
     UNICODE_STRING  ntUnicodeString;    // NT Device Name "\Device\SIOCTL"
     UNICODE_STRING  ntWin32NameString;    // Win32 Name "\DosDevices\IoctlTest"
@@ -132,8 +122,9 @@ Return Value:
     // Initialize the driver object with this driver's entry points.
     //
 
-    DriverObject->MajorFunction[IRP_MJ_CREATE] = SioctlCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE] = SioctlCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = SioctlCreate;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = SioctlClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = SioctlCleanup;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = SioctlDeviceControl;
     DriverObject->DriverUnload = SioctlUnloadDriver;
 
@@ -153,164 +144,265 @@ Return Value:
 
     if ( !NT_SUCCESS( ntStatus ) )
     {
-        //
-        // Delete everything that this routine has allocated.
-        //
         SIOCTL_KDPRINT(("Couldn't create symbolic link\n"));
         IoDeleteDevice( deviceObject );
     }
 
+    //Create Lists, Events and Timers
 
+    PDEVICE_EXT_DATA DeviceExt = DriverObject->DeviceObject->DeviceExtension;
+    ExInitializeFastMutex(&DeviceExt->irp_list_lock);
+    ExInitializeFastMutex(&DeviceExt->irp_reversed_call_list_lock);
+
+    InitializeListHead(&DeviceExt->irp_list_head);
+    InitializeListHead(&DeviceExt->irp_reversed_call_list_head);
+
+    KeInitializeEvent(&DeviceExt->irql_ready_event, NotificationEvent, FALSE);
+    KeInitializeEvent(&DeviceExt->irql_reversed_call_ready_event, NotificationEvent, FALSE);
+    KeInitializeEvent(&DeviceExt->termination_event, NotificationEvent, FALSE);
+
+    KeInitializeTimer(&DeviceExt->reversed_call_timer);
+
+    ntStatus = PsCreateSystemThread(&DeviceExt->irp_thread_handle, GENERIC_ALL, 
+        NULL, NULL, NULL, ProcessRegularIrps, DriverObject);
+    if (!NT_SUCCESS(ntStatus))
+    {
+        SIOCTL_KDPRINT(("Couldn't create thread to handle IRPS\n"));
+        IoDeleteDevice(deviceObject);
+    }
+
+    ntStatus = PsCreateSystemThread(&DeviceExt->periodic_reversed_call_thread_handle, GENERIC_ALL, 
+        NULL, NULL, NULL, generate_reversed_calls, DriverObject);
+    if (!NT_SUCCESS(ntStatus))
+    {
+        SIOCTL_KDPRINT(("Couldn't create thread to handle reversed calls related IRPS\n"));
+        IoDeleteDevice(deviceObject);
+    }
+
+    //Not sure about its value tbh
+    //I mean value is overwritten
     return ntStatus;
 }
 
+void generate_reversed_calls(PDRIVER_OBJECT DriverObject) {
+    PDEVICE_EXT_DATA DeviceExt = DriverObject->DeviceObject->DeviceExtension;
+    NTSTATUS status;
+    LARGE_INTEGER timer_interval;
+    timer_interval.QuadPart = MINLONGLONG; //INFINITE
+
+    while (TRUE) {
+        KeSetTimerEx(&DeviceExt->reversed_call_timer, timer_interval, 3 * 1000 /*3s*/, NULL);
+        status = KeWaitForSingleObject(&DeviceExt->reversed_call_timer, Suspended, KernelMode, TRUE, &timer_interval);
+
+        if (status == STATUS_SUCCESS) {
+            //Complete one IRP
+            PopAndHandleIrp(&DeviceExt->irp_reversed_call_list_head, &DeviceExt->irp_reversed_call_list_lock);
+        }
+
+        //Check for TerminateEvent
+        if (KeReadStateEvent(&DeviceExt->termination_event)) {
+            //Signaled -> Empty Irp list & Exit process
+            CancelAllList(&DeviceExt->irp_reversed_call_list_lock, &DeviceExt->irp_reversed_call_list_head);
+            break;
+        }
+
+    }
+}
+
+NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status, ULONG_PTR info)
+{
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = info;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+NTSTATUS CancelIrp(PIRP Irp)
+{
+    Irp->IoStatus.Status = STATUS_CANCELLED;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_CANCELLED;
+}
 
 NTSTATUS
-SioctlCreateClose(
+SioctlCreate(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp
-    )
-/*++
-
-Routine Description:
-
-    This routine is called by the I/O system when the SIOCTL is opened or
-    closed.
-
-    No action is performed other than completing the request successfully.
-
-Arguments:
-
-    DeviceObject - a pointer to the object that represents the device
-    that I/O is to be done on.
-
-    Irp - a pointer to the I/O Request Packet for this request.
-
-Return Value:
-
-    NT status code
-
---*/
-
-{
+    ) {
     UNREFERENCED_PARAMETER(DeviceObject);
-
     PAGED_CODE();
 
-    Irp->IoStatus.Status = STATUS_SUCCESS;
-    Irp->IoStatus.Information = 0;
+    return CompleteIrp(Irp, STATUS_SUCCESS, 0);
+}
 
-    IoCompleteRequest( Irp, IO_NO_INCREMENT );
+NTSTATUS
+SioctlClose(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+) {
+    PAGED_CODE();
+    PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
+    return CompleteIrp(Irp, STATUS_SUCCESS, 0);
+}
 
-    return STATUS_SUCCESS;
+NTSTATUS
+SioctlCleanup(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp) {
+    PAGED_CODE();
+    PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
+    KeSetEvent(&pdata->termination_event, IO_NO_INCREMENT, FALSE);
+
+    return CompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
 VOID
 SioctlUnloadDriver(
     _In_ PDRIVER_OBJECT DriverObject
-    )
-/*++
-
-Routine Description:
-
-    This routine is called by the I/O system to unload the driver.
-
-    Any resources previously allocated must be freed.
-
-Arguments:
-
-    DriverObject - a pointer to the object that represents our driver.
-
-Return Value:
-
-    None
---*/
-
-{
+    ) {
     PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
     UNICODE_STRING uniWin32NameString;
 
     PAGED_CODE();
 
-    //
-    // Create counted string version of our Win32 device name.
-    //
-
     RtlInitUnicodeString( &uniWin32NameString, DOS_DEVICE_NAME );
-
-
-    //
-    // Delete the link from our device name to a name in the Win32 namespace.
-    //
-
     IoDeleteSymbolicLink( &uniWin32NameString );
 
     if ( deviceObject != NULL )
     {
         IoDeleteDevice( deviceObject );
     }
-
-
-
 }
 
 NTSTATUS
 SioctlDeviceControl(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp
-    )
-
-/*++
-
-Routine Description:
-
-    This routine is called by the I/O system to perform a device I/O
-    control function.
-
-Arguments:
-
-    DeviceObject - a pointer to the object that represents the device
-        that I/O is to be done on.
-
-    Irp - a pointer to the I/O Request Packet for this request.
-
-Return Value:
-
-    NT status code
-
---*/
-
+)
 {
-    PIO_STACK_LOCATION  irpSp;// Pointer to current stack location
-    NTSTATUS            ntStatus = STATUS_SUCCESS;// Assume success
-    ULONG               inBufLength; // Input buffer length
-    ULONG               outBufLength; // Output buffer length
-    
-    PCHAR               inBuf, outBuf; // pointer to Input and output buffer
-    PCHAR               data = "This String is from Device Driver !!!";
-    size_t              datalen = strlen(data)+1;//Length of data including null
-    PMDL                mdl = NULL;
-    PCHAR               buffer = NULL;
-
     UNREFERENCED_PARAMETER(DeviceObject);
 
+    PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
+    NTSTATUS status;
+
+    //Short circuit if termination event signaled
+    if (KeReadStateEvent(&pdata->termination_event)) {
+        CancelIrp(Irp);
+    }
+
+
+    PIO_STACK_LOCATION  irpSp = IoGetCurrentIrpStackLocation(Irp);
+    if (irpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_SIOCTL_INVERTED_CALL) {
+        IoMarkIrpPending(Irp);
+
+        ExInterlockedInsertTailList(&pdata->irp_reversed_call_list_head, &Irp->Tail.Overlay.ListEntry, 
+            &pdata->irp_reversed_call_list_lock);
+        if (!KeReadStateEvent(&pdata->irql_reversed_call_ready_event )) {
+            KeSetEvent(&pdata->irql_reversed_call_ready_event, IO_NO_INCREMENT, FALSE);
+        }
+
+        return STATUS_PENDING;
+    }
+
+    else {
+        ExInterlockedInsertTailList(&pdata->irp_list_head, &Irp->Tail.Overlay.ListEntry, &pdata->irp_list_lock);
+        if (!KeReadStateEvent(&pdata->irql_ready_event)) {
+            KeSetEvent(&pdata->irql_ready_event, IO_NO_INCREMENT, FALSE);
+        }
+
+        return STATUS_SUCCESS;
+    }
+
+}
+
+
+VOID
+CancelAllList(PFAST_MUTEX lock, PLIST_ENTRY list_head) {
+    ExAcquireFastMutex(lock);
+
+    while (!IsListEmpty(list_head)) {
+        PLIST_ENTRY entry = RemoveHeadList(list_head);
+        PIRP Irp = CONTAINING_RECORD(entry,
+            IRP,
+            Tail.
+            Overlay.
+            ListEntry);
+        CancelIrp(Irp);
+    }
+
+    ExReleaseFastMutex(lock);
+}
+
+PIRP PopIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock) {
+    PLIST_ENTRY pListEntry = ExInterlockedRemoveHeadList(list_head, list_lock);
+    PIRP Irp = CONTAINING_RECORD(pListEntry,
+        IRP,
+        Tail.
+        Overlay.
+        ListEntry);
+    return Irp;
+}
+
+VOID 
+PopAndHandleIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock) {
+    PIRP Irp = PopIrp(list_head, list_lock);
+    handleIrps(Irp);
+}
+
+
+VOID
+ProcessRegularIrps(PVOID DriverObject) {
     PAGED_CODE();
 
-    irpSp = IoGetCurrentIrpStackLocation( Irp );
-    inBufLength = irpSp->Parameters.DeviceIoControl.InputBufferLength;
-    outBufLength = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    PDRIVER_OBJECT driver_obj = DriverObject;
+    PDEVICE_EXT_DATA pdata = driver_obj->DeviceObject->DeviceExtension;
+
+    LARGE_INTEGER delay;
+    delay.QuadPart = -100 * 1000;
+    LARGE_INTEGER zero_delay = { 0 };
+    
+    NTSTATUS irql_status;
+    LONG terminate_status;
+
+    while (TRUE) {
+
+        //Lock before IsEmptyCall ? May fail is not done
+        if (IsListEmpty(&pdata->irp_list_head)) {
+            irql_status = KeWaitForSingleObject(&pdata->irql_ready_event, Suspended, KernelMode, TRUE, &delay);
+            if (irql_status == STATUS_SUCCESS) {
+                PopAndHandleIrp(&pdata->irp_list_head, &pdata->irp_list_lock);
+                KeClearEvent(&pdata->irql_ready_event);
+            }
+        }
+        else {
+            PopAndHandleIrp(&pdata->irp_list_head, &pdata->irp_list_lock);
+        }
+
+        //Check for TerminateEvent
+        if (KeReadStateEvent(&pdata->termination_event)) {
+            //Signaled -> Empty Irp list & Exit process
+            CancelAllList(&pdata->irp_list_lock, &pdata->irp_list_head);
+            break;
+        }
+
+    }
+}
+
+VOID handleIrps(PIRP Irp) {
+
+    NTSTATUS ntStatus = STATUS_SUCCESS;
+    PCHAR               inBuf, outBuf; // pointer to Input and output buffer
+
+    PIO_STACK_LOCATION  irpSp = IoGetCurrentIrpStackLocation(Irp);
+    ULONG inBufLength = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG outBufLength = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
 
     if (!inBufLength || !outBufLength)
     {
-        ntStatus = STATUS_INVALID_PARAMETER;
-        goto End;
+        return CompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
     }
 
-    //
-    // Determine which I/O control code was specified.
-    //
-
-    switch ( irpSp->Parameters.DeviceIoControl.IoControlCode )
+    switch (irpSp->Parameters.DeviceIoControl.IoControlCode)
     {
     case IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED:
 
@@ -325,12 +417,12 @@ Return Value:
         //Print data incoming
         SIOCTL_KDPRINT(("\tData from User :"));
         PrintChars(inBuf, inBufLength);
-        
+
         //Allocate buffer to store process names
         USHORT PROCESS_NAMES_SIZE = 1024 * 16;
         UNICODE_STRING processes_names = { 0 };
         processes_names.Length = 0;
-        processes_names.Buffer = (PWCHAR) ExAllocatePool2(POOL_FLAG_PAGED, PROCESS_NAMES_SIZE, '9gaT');
+        processes_names.Buffer = (PWCHAR)ExAllocatePool2(POOL_FLAG_PAGED, PROCESS_NAMES_SIZE, '9gaT');
         processes_names.MaximumLength = PROCESS_NAMES_SIZE;
 
         UNICODE_STRING comma;
@@ -343,7 +435,7 @@ Return Value:
         int SPI_BUFFER_SIZE = 1 * 1024 * 1024;
         PVOID spi_buffer = ExAllocatePool2(POOL_FLAG_PAGED, SPI_BUFFER_SIZE, '9gaT');
         if (spi_buffer) {
-            PSYSTEM_PROCESS_INFORMATION pspi = (PSYSTEM_PROCESS_INFORMATION) spi_buffer;
+            PSYSTEM_PROCESS_INFORMATION pspi = (PSYSTEM_PROCESS_INFORMATION)spi_buffer;
             if (NT_SUCCESS(ZwQuerySystemInformation(SystemProcessInformation, pspi, SPI_BUFFER_SIZE, NULL))) {
 
                 while (pspi->NextEntryOffset) {
@@ -362,395 +454,25 @@ Return Value:
                 ExFreePoolWithTag(spi_buffer, '9gaT');
                 ExFreePoolWithTag(processes_names.Buffer, '9gaT');
 
-                Irp->IoStatus.Information = processes_names.Length < outBufLength ? 
+                Irp->IoStatus.Information = processes_names.Length < outBufLength ?
                     processes_names.Length : outBufLength;
             }
         }
-        
-        
-        break;
 
-    case IOCTL_SIOCTL_METHOD_BUFFERED:
-
-        //
-        // In this method the I/O manager allocates a buffer large enough to
-        // to accommodate larger of the user input buffer and output buffer,
-        // assigns the address to Irp->AssociatedIrp.SystemBuffer, and
-        // copies the content of the user input buffer into this SystemBuffer
-        //
-
-        SIOCTL_KDPRINT(("Called IOCTL_SIOCTL_METHOD_BUFFERED\n"));
-        PrintIrpInfo(Irp);
-
-        //
-        // Input buffer and output buffer is same in this case, read the
-        // content of the buffer before writing to it
-        //
-
-        inBuf = Irp->AssociatedIrp.SystemBuffer;
-        outBuf = Irp->AssociatedIrp.SystemBuffer;
-
-        //
-        // Read the data from the buffer
-        //
-
-        SIOCTL_KDPRINT(("\tData from User :"));
-        //
-        // We are using the following function to print characters instead
-        // DebugPrint with %s format because we string we get may or
-        // may not be null terminated.
-        //
-        PrintChars(inBuf, inBufLength);
-
-        //
-        // Write to the buffer over-writes the input buffer content
-        //
-
-        RtlCopyBytes(outBuf, data, datalen);
-
-        SIOCTL_KDPRINT(("\tData to User : "));
-        PrintChars(outBuf, datalen  );
-
-        //
-        // Assign the length of the data copied to IoStatus.Information
-        // of the Irp and complete the Irp.
-        //
-
-        Irp->IoStatus.Information = (outBufLength<datalen?outBufLength:datalen);
-
-        //
-        // When the Irp is completed the content of the SystemBuffer
-        // is copied to the User output buffer and the SystemBuffer is
-        // is freed.
-        //
-
-       break;
-
-    case IOCTL_SIOCTL_METHOD_NEITHER:
-
-        //
-        // In this type of transfer the I/O manager assigns the user input
-        // to Type3InputBuffer and the output buffer to UserBuffer of the Irp.
-        // The I/O manager doesn't copy or map the buffers to the kernel
-        // buffers. Nor does it perform any validation of user buffer's address
-        // range.
-        //
-
-
-        SIOCTL_KDPRINT(("Called IOCTL_SIOCTL_METHOD_NEITHER\n"));
-
-        PrintIrpInfo(Irp);
-
-        //
-        // A driver may access these buffers directly if it is a highest level
-        // driver whose Dispatch routine runs in the context
-        // of the thread that made this request. The driver should always
-        // check the validity of the user buffer's address range and check whether
-        // the appropriate read or write access is permitted on the buffer.
-        // It must also wrap its accesses to the buffer's address range within
-        // an exception handler in case another user thread deallocates the buffer
-        // or attempts to change the access rights for the buffer while the driver
-        // is accessing memory.
-        //
-
-        inBuf = irpSp->Parameters.DeviceIoControl.Type3InputBuffer;
-        outBuf =  Irp->UserBuffer;
-
-        //
-        // Access the buffers directly if only if you are running in the
-        // context of the calling process. Only top level drivers are
-        // guaranteed to have the context of process that made the request.
-        //
-
-        try {
-            //
-            // Before accessing user buffer, you must probe for read/write
-            // to make sure the buffer is indeed an userbuffer with proper access
-            // rights and length. ProbeForRead/Write will raise an exception if it's otherwise.
-            //
-            ProbeForRead( inBuf, inBufLength, sizeof( UCHAR ) );
-
-            //
-            // Since the buffer access rights can be changed or buffer can be freed
-            // anytime by another thread of the same process, you must always access
-            // it within an exception handler.
-            //
-
-            SIOCTL_KDPRINT(("\tData from User :"));
-            PrintChars(inBuf, inBufLength);
-
-        }
-        except(EXCEPTION_EXECUTE_HANDLER)
-        {
-
-            ntStatus = GetExceptionCode();
-            SIOCTL_KDPRINT((
-                "Exception while accessing inBuf 0X%08X in METHOD_NEITHER\n",
-                            ntStatus));
-            break;
-        }
-
-
-        //
-        // If you are accessing these buffers in an arbitrary thread context,
-        // say in your DPC or ISR, if you are using it for DMA, or passing these buffers to the
-        // next level driver, you should map them in the system process address space.
-        // First allocate an MDL large enough to describe the buffer
-        // and initilize it. Please note that on a x86 system, the maximum size of a buffer
-        // that an MDL can describe is 65508 KB.
-        //
-
-        mdl = IoAllocateMdl(inBuf, inBufLength,  FALSE, TRUE, NULL);
-        if (!mdl)
-        {
-            ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-
-        try
-        {
-
-            //
-            // Probe and lock the pages of this buffer in physical memory.
-            // You can specify IoReadAccess, IoWriteAccess or IoModifyAccess
-            // Always perform this operation in a try except block.
-            //  MmProbeAndLockPages will raise an exception if it fails.
-            //
-            MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
-        }
-        except(EXCEPTION_EXECUTE_HANDLER)
-        {
-
-            ntStatus = GetExceptionCode();
-            SIOCTL_KDPRINT((
-                "Exception while locking inBuf 0X%08X in METHOD_NEITHER\n",
-                    ntStatus));
-            IoFreeMdl(mdl);
-            break;
-        }
-
-        //
-        // Map the physical pages described by the MDL into system space.
-        // Note: double mapping the buffer this way causes lot of
-        // system overhead for large size buffers.
-        //
-
-        buffer = MmGetSystemAddressForMdlSafe( mdl, NormalPagePriority | MdlMappingNoExecute );
-
-        if (!buffer) {
-                ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-                MmUnlockPages(mdl);
-                IoFreeMdl(mdl);
-                break;
-        }
-
-        //
-        // Now you can safely read the data from the buffer.
-        //
-        SIOCTL_KDPRINT(("\tData from User (SystemAddress) : "));
-        PrintChars(buffer, inBufLength);
-
-        //
-        // Once the read is over unmap and unlock the pages.
-        //
-
-        MmUnlockPages(mdl);
-        IoFreeMdl(mdl);
-
-        //
-        // The same steps can be followed to access the output buffer.
-        //
-
-        mdl = IoAllocateMdl(outBuf, outBufLength,  FALSE, TRUE, NULL);
-        if (!mdl)
-        {
-            ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-
-
-        try {
-            //
-            // Probe and lock the pages of this buffer in physical memory.
-            // You can specify IoReadAccess, IoWriteAccess or IoModifyAccess.
-            //
-
-            MmProbeAndLockPages(mdl, UserMode, IoWriteAccess);
-        }
-        except(EXCEPTION_EXECUTE_HANDLER)
-        {
-
-            ntStatus = GetExceptionCode();
-            SIOCTL_KDPRINT((
-                "Exception while locking outBuf 0X%08X in METHOD_NEITHER\n",
-                    ntStatus));
-            IoFreeMdl(mdl);
-            break;
-        }
-
-
-        buffer = MmGetSystemAddressForMdlSafe( mdl, NormalPagePriority | MdlMappingNoExecute );
-
-        if (!buffer) {
-            MmUnlockPages(mdl);
-            IoFreeMdl(mdl);
-            ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-        //
-        // Write to the buffer
-        //
-
-        RtlCopyBytes(buffer, data, datalen);
-
-        SIOCTL_KDPRINT(("\tData to User : %s\n", buffer));
-        PrintChars(buffer, datalen);
-
-        MmUnlockPages(mdl);
-
-        //
-        // Free the allocated MDL
-        //
-
-        IoFreeMdl(mdl);
-
-        //
-        // Assign the length of the data copied to IoStatus.Information
-        // of the Irp and complete the Irp.
-        //
-
-        Irp->IoStatus.Information = (outBufLength<datalen?outBufLength:datalen);
 
         break;
 
-    case IOCTL_SIOCTL_METHOD_IN_DIRECT:
-
-        //
-        // In this type of transfer,  the I/O manager allocates a system buffer
-        // large enough to accommodatethe User input buffer, sets the buffer address
-        // in Irp->AssociatedIrp.SystemBuffer and copies the content of user input buffer
-        // into the SystemBuffer. For the user output buffer, the  I/O manager
-        // probes to see whether the virtual address is readable in the callers
-        // access mode, locks the pages in memory and passes the pointer to
-        // MDL describing the buffer in Irp->MdlAddress.
-        //
-
-        SIOCTL_KDPRINT(("Called IOCTL_SIOCTL_METHOD_IN_DIRECT\n"));
-
-        PrintIrpInfo(Irp);
-
-        inBuf = Irp->AssociatedIrp.SystemBuffer;
-
-        SIOCTL_KDPRINT(("\tData from User in InputBuffer: "));
-        PrintChars(inBuf, inBufLength);
-
-        //
-        // To access the output buffer, just get the system address
-        // for the buffer. For this method, this buffer is intended for transfering data
-        // from the application to the driver.
-        //
-
-        buffer = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
-
-        if (!buffer) {
-            ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-
-        SIOCTL_KDPRINT(("\tData from User in OutputBuffer: "));
-        PrintChars(buffer, outBufLength);
-
-        //
-        // Return total bytes read from the output buffer.
-        // Note OutBufLength = MmGetMdlByteCount(Irp->MdlAddress)
-        //
-
-        Irp->IoStatus.Information = MmGetMdlByteCount(Irp->MdlAddress);
-
-        //
-        // NOTE: Changes made to the  SystemBuffer are not copied
-        // to the user input buffer by the I/O manager
-        //
-
-      break;
-
-    case IOCTL_SIOCTL_METHOD_OUT_DIRECT:
-
-        //
-        // In this type of transfer, the I/O manager allocates a system buffer
-        // large enough to accommodate the User input buffer, sets the buffer address
-        // in Irp->AssociatedIrp.SystemBuffer and copies the content of user input buffer
-        // into the SystemBuffer. For the output buffer, the I/O manager
-        // probes to see whether the virtual address is writable in the callers
-        // access mode, locks the pages in memory and passes the pointer to MDL
-        // describing the buffer in Irp->MdlAddress.
-        //
-
-
-        SIOCTL_KDPRINT(("Called IOCTL_SIOCTL_METHOD_OUT_DIRECT\n"));
-
-        PrintIrpInfo(Irp);
-
-
-        inBuf = Irp->AssociatedIrp.SystemBuffer;
-
-        SIOCTL_KDPRINT(("\tData from User : "));
-        PrintChars(inBuf, inBufLength);
-
-        //
-        // To access the output buffer, just get the system address
-        // for the buffer. For this method, this buffer is intended for transfering data
-        // from the driver to the application.
-        //
-
-        buffer = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
-
-        if (!buffer) {
-            ntStatus = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-
-        //
-        // Write data to be sent to the user in this buffer
-        //
-
-        RtlCopyBytes(buffer, data, datalen);
-
-        SIOCTL_KDPRINT(("\tData to User : "));
-        PrintChars(buffer, datalen);
-
-        Irp->IoStatus.Information = (outBufLength<datalen?outBufLength:datalen);
-
-        //
-        // NOTE: Changes made to the  SystemBuffer are not copied
-        // to the user input buffer by the I/O manager
-        //
-
-        break;
+    case IOCTL_SIOCTL_INVERTED_CALL:
+        //Nothing to do
+        Irp->IoStatus.Information = 0;
 
     default:
-
-        //
-        // The specified I/O control code is unrecognized by this driver.
-        //
-
-        ntStatus = STATUS_INVALID_DEVICE_REQUEST;
-        SIOCTL_KDPRINT(("ERROR: unrecognized IOCTL %x\n",
-            irpSp->Parameters.DeviceIoControl.IoControlCode));
         break;
+
     }
 
-End:
-    //
-    // Finish the I/O operation by simply completing the packet and returning
-    // the same status as in the packet itself.
-    //
-
     Irp->IoStatus.Status = ntStatus;
-
-    IoCompleteRequest( Irp, IO_NO_INCREMENT );
-
-    return ntStatus;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
 }
 
 VOID
