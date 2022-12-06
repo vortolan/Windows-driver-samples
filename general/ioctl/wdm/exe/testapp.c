@@ -23,6 +23,8 @@ Environment:
 
 #include <conio.h>
 
+#define IRP_NB 10
+
 
 BOOLEAN
 ManageDriver(
@@ -46,7 +48,9 @@ main(
     _In_reads_(argc) PCHAR argv[]
     )
 {
-    HANDLE hDevice;
+    HANDLE hSyncDevice;
+    HANDLE hAsyncDevice;
+
     BOOL bRc;
     ULONG bytesReturned;
     DWORD errNum = 0;
@@ -59,7 +63,7 @@ main(
     // open the device
     //
 
-    if ((hDevice = CreateFile( "\\\\.\\IoctlTest",
+    if ((hSyncDevice = CreateFile( "\\\\.\\IoctlTest",
                             GENERIC_READ | GENERIC_WRITE,
                             0,
                             NULL,
@@ -105,19 +109,38 @@ main(
             return;
         }
 
-        hDevice = CreateFile( "\\\\.\\IoctlTest",
+        hSyncDevice = CreateFile( "\\\\.\\IoctlTest",
                             GENERIC_READ | GENERIC_WRITE,
                             0,
                             NULL,
                             CREATE_ALWAYS,
-                            FILE_FLAG_OVERLAPPED,
+                            FILE_ATTRIBUTE_NORMAL,
                             NULL);
 
-        if ( hDevice == INVALID_HANDLE_VALUE ){
+        if ( hSyncDevice == INVALID_HANDLE_VALUE ){
             printf ( "Error: CreatFile Failed : %d\n", GetLastError());
             return;
         }
 
+    }
+    OVERLAPPED ovelapped_device_handle;
+    //Open async handle too
+    if ((hAsyncDevice = CreateFile("\\\\.\\IoctlTest",
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_FLAG_OVERLAPPED,
+        &ovelapped_device_handle)) == INVALID_HANDLE_VALUE) {
+
+        errNum = GetLastError();
+
+        if (errNum != ERROR_FILE_NOT_FOUND) {
+
+            printf("CreateFile failed : %d\n", errNum);
+
+            return;
+        }
     }
 
     //
@@ -132,12 +155,32 @@ main(
     //Send a lot of IRP inverted call
     //OVERLAPPED
     //THEN wait for multiple objects on the OVERLAPPED structs
-    OVERLAPPED overlapped_handles[10];
+    int event_nb = IRP_NB;
+    HANDLE* hEvents = malloc(event_nb * sizeof(HANDLE));
+    OVERLAPPED* overlapped_handles = malloc(event_nb * sizeof(OVERLAPPED));
 
-    for (int i = 0; i < sizeof(overlapped_handles) / sizeof(overlapped_handles[0]); ++i) {
+    for (int i = 0; i < IRP_NB; ++i) {
+        //Create event
+        hEvents[i] = CreateEvent(
+            NULL,    // default security attribute 
+            TRUE,    // manual-reset event 
+            FALSE,    // initial state = signaled 
+            NULL);   // unnamed event object 
+
+        if (hEvents[i] == NULL)
+        {
+            printf("CreateEvent failed with %d.\n", GetLastError());
+            return;
+        }
+
+        //Map event to OVERLAPPED struct
+        overlapped_handles[i].hEvent = hEvents[i];
+        overlapped_handles[i].Offset = 0;
+        overlapped_handles[i].OffsetHigh = 0;
+
         memset(OutputBuffer, 0, sizeof(OutputBuffer));
 
-        bRc = DeviceIoControl(hDevice,
+        bRc = DeviceIoControl(hAsyncDevice,
             (DWORD)IOCTL_SIOCTL_INVERTED_CALL,
             &InputBuffer,
             (DWORD)strlen(InputBuffer) + 1,
@@ -148,11 +191,11 @@ main(
         );
     }
 
+
     //
     // Performing METHOD_BUFFERED Process list
     //
 
-    OVERLAPPED process_list_overlapped;
     StringCbCopy(InputBuffer, sizeof(InputBuffer),
         "Hey, get me the list of running processes please!");
 
@@ -160,14 +203,14 @@ main(
 
     memset(OutputBuffer, 0, sizeof(OutputBuffer));
 
-    bRc = DeviceIoControl(hDevice,
+    bRc = DeviceIoControl(hSyncDevice,
         (DWORD)IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED,
         &InputBuffer,
         (DWORD)strlen(InputBuffer) + 1,
         &OutputBuffer,
         sizeof(OutputBuffer),
         &bytesReturned,
-        &process_list_overlapped
+        NULL
     );
 
     if (!bRc)
@@ -179,17 +222,71 @@ main(
     
     wprintf(L"OutBuffer (%d): %s\n", bytesReturned, (WCHAR*) OutputBuffer);
 
-    CloseHandle ( hDevice );
+
+    //Wait for async IRP
+    DWORD wait_result;
+    int index;
+    DWORD bytes_transferred;
+
+    while (event_nb > 0) {
+        wait_result = WaitForMultipleObjects(event_nb, hEvents, FALSE, 5000);
+
+        index = wait_result - STATUS_WAIT_0;
+        if (index < 0 || index > event_nb - 1) {
+            printf("Index out of range");
+            break;
+        }
+
+        if (GetOverlappedResult(hEvents[index], &overlapped_handles[index], &bytes_transferred, TRUE)) {
+            //Sucess
+            printf("IRP Number %d complete\n", index + (IRP_NB - event_nb));
+        }
+        else {
+            printf("IRP failed");
+        }
+
+        //Reduce size of arrays
+        event_nb -= 1;
+        if (event_nb) {
+            HANDLE* newhEvents = malloc(event_nb * sizeof(HANDLE));
+            OVERLAPPED* new_overlapped_handles = malloc(event_nb * sizeof(OVERLAPPED));
+            int corrected_index = 0;
+
+            for (int i = 0; i < event_nb + 1; ++i) {
+                if (i != index) {
+                    newhEvents[corrected_index] = hEvents[i];
+                    new_overlapped_handles[corrected_index] = overlapped_handles[i];
+                    ++corrected_index;
+                }
+                else {
+                    CloseHandle(hEvents[i]);
+                }
+            }
+
+            free(hEvents);
+            free(overlapped_handles);
+
+            hEvents = newhEvents;
+            overlapped_handles = new_overlapped_handles;
+        }
+        else {
+            CloseHandle(hEvents[0]);
+            free(hEvents);
+            free(overlapped_handles);
+        }
+    }
 
     //
-    // Unload the driver.  Ignore any errors.
+    // Close handles and Unload the driver.  Ignore any errors.
     //
+
+    CloseHandle(hAsyncDevice);
+    CloseHandle(hSyncDevice);
 
     ManageDriver(DRIVER_NAME,
                  driverLocation,
                  DRIVER_FUNC_REMOVE
                  );
-
 
     _getch();
 
