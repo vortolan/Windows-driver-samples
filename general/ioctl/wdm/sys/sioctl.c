@@ -24,13 +24,12 @@ Environment:
 // Include files.
 //
 
-#include <ntddk.h>          // various NT definitions
+//#include <ntddk.h>
 #include "sioctl.h"
 #include "winternl-defs.h"
-#include <ntstrsafe.h>
-#include <wdm.h>
-
 #include "structures.h"
+#include <ntstrsafe.h>
+
 
 #define NT_DEVICE_NAME      L"\\Device\\SIOCTL"
 #define DOS_DEVICE_NAME     L"\\DosDevices\\IoctlTest"
@@ -43,6 +42,7 @@ Environment:
 #else
 #define SIOCTL_KDPRINT(_x_)
 #endif
+
 
 //
 // Device driver routine declarations.
@@ -67,15 +67,22 @@ DRIVER_UNLOAD SioctlUnloadDriver;
 VOID
 PrintIrpInfo(
     PIRP Irp
-    );
+);
 VOID
 PrintChars(
     _In_reads_(CountChars) PCHAR BufferAddress,
     _In_ size_t CountChars
-    );
+);
 
-VOID
-ProcessRegularIrps(PVOID DriverObject);
+//Functions declaration
+
+void generate_reversed_calls(PVOID DriverObject);
+NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status, ULONG_PTR info);
+NTSTATUS CancelIrp(PIRP Irp);
+VOID CancelAllList(PKSPIN_LOCK lock, PLIST_ENTRY list_head);
+PIRP PopIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock);
+NTSTATUS processIrp(PIRP Irp);
+
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text( INIT, DriverEntry )
@@ -87,6 +94,7 @@ ProcessRegularIrps(PVOID DriverObject);
 #pragma alloc_text( PAGE, PrintIrpInfo)
 #pragma alloc_text( PAGE, PrintChars)
 #endif // ALLOC_PRAGMA
+
 
 
 NTSTATUS
@@ -105,7 +113,7 @@ DriverEntry(
 
     ntStatus = IoCreateDevice(
         DriverObject,                   // Our Driver Object
-        0,                              // We don't use a device extension
+        sizeof(DEVICE_EXT_DATA),                              // We do use a device extension
         &ntUnicodeString,               // Device name "\Device\SIOCTL"
         FILE_DEVICE_UNKNOWN,            // Device type
         FILE_DEVICE_SECURE_OPEN,     // Device characteristics
@@ -118,27 +126,13 @@ DriverEntry(
         return ntStatus;
     }
 
-    //
-    // Initialize the driver object with this driver's entry points.
-    //
-
     DriverObject->MajorFunction[IRP_MJ_CREATE] = SioctlCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = SioctlClose;
     DriverObject->MajorFunction[IRP_MJ_CLEANUP] = SioctlCleanup;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = SioctlDeviceControl;
     DriverObject->DriverUnload = SioctlUnloadDriver;
 
-    //
-    // Initialize a Unicode String containing the Win32 name
-    // for our device.
-    //
-
     RtlInitUnicodeString( &ntWin32NameString, DOS_DEVICE_NAME );
-
-    //
-    // Create a symbolic link between our device name  and the Win32 name
-    //
-
     ntStatus = IoCreateSymbolicLink(
                         &ntWin32NameString, &ntUnicodeString );
 
@@ -151,25 +145,10 @@ DriverEntry(
     //Create Lists, Events and Timers
 
     PDEVICE_EXT_DATA DeviceExt = DriverObject->DeviceObject->DeviceExtension;
-    ExInitializeFastMutex(&DeviceExt->irp_list_lock);
-    ExInitializeFastMutex(&DeviceExt->irp_reversed_call_list_lock);
-
-    InitializeListHead(&DeviceExt->irp_list_head);
+    KeInitializeSpinLock(&DeviceExt->irp_reversed_call_list_lock);
     InitializeListHead(&DeviceExt->irp_reversed_call_list_head);
-
-    KeInitializeEvent(&DeviceExt->irql_ready_event, NotificationEvent, FALSE);
-    KeInitializeEvent(&DeviceExt->irql_reversed_call_ready_event, NotificationEvent, FALSE);
+    KeInitializeEvent(&DeviceExt->irql_inverted_call_ready_event, NotificationEvent, FALSE);
     KeInitializeEvent(&DeviceExt->termination_event, NotificationEvent, FALSE);
-
-    KeInitializeTimer(&DeviceExt->reversed_call_timer);
-
-    ntStatus = PsCreateSystemThread(&DeviceExt->irp_thread_handle, GENERIC_ALL, 
-        NULL, NULL, NULL, ProcessRegularIrps, DriverObject);
-    if (!NT_SUCCESS(ntStatus))
-    {
-        SIOCTL_KDPRINT(("Couldn't create thread to handle IRPS\n"));
-        IoDeleteDevice(deviceObject);
-    }
 
     ntStatus = PsCreateSystemThread(&DeviceExt->periodic_reversed_call_thread_handle, GENERIC_ALL, 
         NULL, NULL, NULL, generate_reversed_calls, DriverObject);
@@ -179,33 +158,30 @@ DriverEntry(
         IoDeleteDevice(deviceObject);
     }
 
-    //Not sure about its value tbh
-    //I mean value is overwritten
     return ntStatus;
 }
 
-void generate_reversed_calls(PDRIVER_OBJECT DriverObject) {
-    PDEVICE_EXT_DATA DeviceExt = DriverObject->DeviceObject->DeviceExtension;
+void generate_reversed_calls(PVOID DriverObject) {
+    PDRIVER_OBJECT DriverObj = DriverObject;
+    PDEVICE_EXT_DATA DeviceExt = DriverObj->DeviceObject->DeviceExtension;
     NTSTATUS status;
+
     LARGE_INTEGER timer_interval;
-    timer_interval.QuadPart = MINLONGLONG; //INFINITE
+    timer_interval.QuadPart = -3 * 10 * 1000 * 1000; //3s
 
     while (TRUE) {
-        KeSetTimerEx(&DeviceExt->reversed_call_timer, timer_interval, 3 * 1000 /*3s*/, NULL);
-        status = KeWaitForSingleObject(&DeviceExt->reversed_call_timer, Suspended, KernelMode, TRUE, &timer_interval);
+        status = KeWaitForSingleObject(&DeviceExt->termination_event, Executive, KernelMode, TRUE, &timer_interval);
 
-        if (status == STATUS_SUCCESS) {
+        if (status == STATUS_TIMEOUT) {
             //Complete one IRP
-            PopAndHandleIrp(&DeviceExt->irp_reversed_call_list_head, &DeviceExt->irp_reversed_call_list_lock);
+            PIRP Irp = PopIrp(&DeviceExt->irp_reversed_call_list_head, &DeviceExt->irp_reversed_call_list_lock);
+            if (Irp) {
+                CompleteIrp(Irp, STATUS_SUCCESS, 0);
+            }
         }
-
-        //Check for TerminateEvent
-        if (KeReadStateEvent(&DeviceExt->termination_event)) {
-            //Signaled -> Empty Irp list & Exit process
-            CancelAllList(&DeviceExt->irp_reversed_call_list_lock, &DeviceExt->irp_reversed_call_list_head);
+        else if (status == STATUS_SUCCESS || status == STATUS_ALERTED) {
             break;
         }
-
     }
 }
 
@@ -218,10 +194,7 @@ NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status, ULONG_PTR info)
 }
 NTSTATUS CancelIrp(PIRP Irp)
 {
-    Irp->IoStatus.Status = STATUS_CANCELLED;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_CANCELLED;
+    return CompleteIrp(Irp, STATUS_CANCELLED, 0);
 }
 
 NTSTATUS
@@ -240,8 +213,8 @@ SioctlClose(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp
 ) {
+    UNREFERENCED_PARAMETER(DeviceObject);
     PAGED_CODE();
-    PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
@@ -251,6 +224,8 @@ SioctlCleanup(
     PIRP Irp) {
     PAGED_CODE();
     PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
+
+    CancelAllList(&pdata->irp_reversed_call_list_lock, &pdata->irp_reversed_call_list_head);
     KeSetEvent(&pdata->termination_event, IO_NO_INCREMENT, FALSE);
 
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
@@ -260,7 +235,7 @@ VOID
 SioctlUnloadDriver(
     _In_ PDRIVER_OBJECT DriverObject
     ) {
-    PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
+    PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject; 
     UNICODE_STRING uniWin32NameString;
 
     PAGED_CODE();
@@ -281,44 +256,26 @@ SioctlDeviceControl(
 )
 {
     UNREFERENCED_PARAMETER(DeviceObject);
-
     PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
-    NTSTATUS status;
-
-    //Short circuit if termination event signaled
-    if (KeReadStateEvent(&pdata->termination_event)) {
-        CancelIrp(Irp);
-    }
-
 
     PIO_STACK_LOCATION  irpSp = IoGetCurrentIrpStackLocation(Irp);
-    if (irpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_SIOCTL_INVERTED_CALL) {
-        IoMarkIrpPending(Irp);
-
-        ExInterlockedInsertTailList(&pdata->irp_reversed_call_list_head, &Irp->Tail.Overlay.ListEntry, 
-            &pdata->irp_reversed_call_list_lock);
-        if (!KeReadStateEvent(&pdata->irql_reversed_call_ready_event )) {
-            KeSetEvent(&pdata->irql_reversed_call_ready_event, IO_NO_INCREMENT, FALSE);
-        }
-
-        return STATUS_PENDING;
+    if (irpSp->Parameters.DeviceIoControl.IoControlCode != IOCTL_SIOCTL_INVERTED_CALL) {
+        return processIrp(Irp);
     }
-
     else {
-        ExInterlockedInsertTailList(&pdata->irp_list_head, &Irp->Tail.Overlay.ListEntry, &pdata->irp_list_lock);
-        if (!KeReadStateEvent(&pdata->irql_ready_event)) {
-            KeSetEvent(&pdata->irql_ready_event, IO_NO_INCREMENT, FALSE);
-        }
-
-        return STATUS_SUCCESS;
+        IoMarkIrpPending(Irp);
+        ExInterlockedInsertTailList(&pdata->irp_reversed_call_list_head, &Irp->Tail.Overlay.ListEntry,
+            &pdata->irp_reversed_call_list_lock);
+        return STATUS_PENDING;
     }
 
 }
 
 
 VOID
-CancelAllList(PFAST_MUTEX lock, PLIST_ENTRY list_head) {
-    ExAcquireFastMutex(lock);
+CancelAllList(PKSPIN_LOCK lock, PLIST_ENTRY list_head) {
+    KIRQL old_irql;
+    KeAcquireSpinLock(lock, &old_irql);
 
     while (!IsListEmpty(list_head)) {
         PLIST_ENTRY entry = RemoveHeadList(list_head);
@@ -330,65 +287,25 @@ CancelAllList(PFAST_MUTEX lock, PLIST_ENTRY list_head) {
         CancelIrp(Irp);
     }
 
-    ExReleaseFastMutex(lock);
+    KeReleaseSpinLock(lock, old_irql);
 }
 
 PIRP PopIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock) {
     PLIST_ENTRY pListEntry = ExInterlockedRemoveHeadList(list_head, list_lock);
-    PIRP Irp = CONTAINING_RECORD(pListEntry,
-        IRP,
-        Tail.
-        Overlay.
-        ListEntry);
-    return Irp;
-}
-
-VOID 
-PopAndHandleIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock) {
-    PIRP Irp = PopIrp(list_head, list_lock);
-    handleIrps(Irp);
-}
-
-
-VOID
-ProcessRegularIrps(PVOID DriverObject) {
-    PAGED_CODE();
-
-    PDRIVER_OBJECT driver_obj = DriverObject;
-    PDEVICE_EXT_DATA pdata = driver_obj->DeviceObject->DeviceExtension;
-
-    LARGE_INTEGER delay;
-    delay.QuadPart = -100 * 1000;
-    LARGE_INTEGER zero_delay = { 0 };
-    
-    NTSTATUS irql_status;
-    LONG terminate_status;
-
-    while (TRUE) {
-
-        //Lock before IsEmptyCall ? May fail is not done
-        if (IsListEmpty(&pdata->irp_list_head)) {
-            irql_status = KeWaitForSingleObject(&pdata->irql_ready_event, Suspended, KernelMode, TRUE, &delay);
-            if (irql_status == STATUS_SUCCESS) {
-                PopAndHandleIrp(&pdata->irp_list_head, &pdata->irp_list_lock);
-                KeClearEvent(&pdata->irql_ready_event);
-            }
-        }
-        else {
-            PopAndHandleIrp(&pdata->irp_list_head, &pdata->irp_list_lock);
-        }
-
-        //Check for TerminateEvent
-        if (KeReadStateEvent(&pdata->termination_event)) {
-            //Signaled -> Empty Irp list & Exit process
-            CancelAllList(&pdata->irp_list_lock, &pdata->irp_list_head);
-            break;
-        }
-
+    if (!pListEntry) {
+        return NULL;
+    }
+    else {
+        PIRP Irp = CONTAINING_RECORD(pListEntry,
+            IRP,
+            Tail.
+            Overlay.
+            ListEntry);
+        return Irp;
     }
 }
 
-VOID handleIrps(PIRP Irp) {
+NTSTATUS processIrp(PIRP Irp) {
 
     NTSTATUS ntStatus = STATUS_SUCCESS;
     PCHAR               inBuf, outBuf; // pointer to Input and output buffer
@@ -402,10 +319,7 @@ VOID handleIrps(PIRP Irp) {
         return CompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
     }
 
-    switch (irpSp->Parameters.DeviceIoControl.IoControlCode)
-    {
-    case IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED:
-
+    if (irpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED) {
         //Debug info
         SIOCTL_KDPRINT(("Called IOCTL_SIOCTL_QUERY_PROCESS_LIST_METHOD_BUFFERED\n"));
         PrintIrpInfo(Irp);
@@ -458,21 +372,16 @@ VOID handleIrps(PIRP Irp) {
                     processes_names.Length : outBufLength;
             }
         }
-
-
-        break;
-
-    case IOCTL_SIOCTL_INVERTED_CALL:
-        //Nothing to do
+    }
+    else {
+        //Not expected IOCode
         Irp->IoStatus.Information = 0;
-
-    default:
-        break;
-
+        ntStatus = STATUS_INVALID_PARAMETER;
     }
 
     Irp->IoStatus.Status = ntStatus;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return ntStatus;
 }
 
 VOID

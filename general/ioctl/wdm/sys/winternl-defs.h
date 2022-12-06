@@ -2,8 +2,6 @@
 
 #include <ntddk.h>
 
-
-
 typedef struct _SYSTEM_PROCESS_INFORMATION {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;

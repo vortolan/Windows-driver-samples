@@ -50,4 +50,3 @@ Environment:
 #define DRIVER_FUNC_REMOVE      0x02
 
 #define DRIVER_NAME       "SIoctl"
-
