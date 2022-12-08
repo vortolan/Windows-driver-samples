@@ -79,9 +79,16 @@ PrintChars(
 void generate_reversed_calls(PVOID DriverObject);
 NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status, ULONG_PTR info);
 NTSTATUS CancelIrp(PIRP Irp);
-VOID CancelAllList(PKSPIN_LOCK lock, PLIST_ENTRY list_head);
 PIRP PopIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock);
 NTSTATUS processIrp(PIRP Irp);
+
+//CSQ Functions
+IO_CSQ_INSERT_IRP CsqInsertIrp;
+IO_CSQ_REMOVE_IRP CsqRemoveIrp;
+IO_CSQ_PEEK_NEXT_IRP CsqPeekNextIrp;
+IO_CSQ_ACQUIRE_LOCK CsqAcquireLock;
+IO_CSQ_RELEASE_LOCK CsqReleaseLock;
+IO_CSQ_COMPLETE_CANCELED_IRP CsqCompleteCanceledIrp;
 
 
 #ifdef ALLOC_PRAGMA
@@ -145,10 +152,13 @@ DriverEntry(
     //Create Lists, Events and Timers
 
     PDEVICE_EXT_DATA DeviceExt = DriverObject->DeviceObject->DeviceExtension;
-    KeInitializeSpinLock(&DeviceExt->irp_reversed_call_list_lock);
-    InitializeListHead(&DeviceExt->irp_reversed_call_list_head);
+    KeInitializeSpinLock(&DeviceExt->pending_irp_queue_lock);
+    InitializeListHead(&DeviceExt->pending_irp_queue);
     KeInitializeEvent(&DeviceExt->irql_inverted_call_ready_event, NotificationEvent, FALSE);
     KeInitializeEvent(&DeviceExt->termination_event, NotificationEvent, FALSE);
+
+    IoCsqInitialize(&DeviceExt->cancel_safe_queue, CsqInsertIrp, CsqRemoveIrp, CsqPeekNextIrp, 
+        CsqAcquireLock, CsqReleaseLock, CsqCompleteCanceledIrp);
 
     ntStatus = PsCreateSystemThread(&DeviceExt->periodic_reversed_call_thread_handle, GENERIC_ALL, 
         NULL, NULL, NULL, generate_reversed_calls, DriverObject);
@@ -174,7 +184,7 @@ void generate_reversed_calls(PVOID DriverObject) {
 
         if (status == STATUS_TIMEOUT) {
             //Complete one IRP
-            PIRP Irp = PopIrp(&DeviceExt->irp_reversed_call_list_head, &DeviceExt->irp_reversed_call_list_lock);
+            PIRP Irp = IoCsqRemoveNextIrp(&DeviceExt->cancel_safe_queue, NULL);
             if (Irp) {
                 CompleteIrp(Irp, STATUS_SUCCESS, 0);
             }
@@ -191,10 +201,6 @@ NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status, ULONG_PTR info)
     Irp->IoStatus.Information = info;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
-}
-NTSTATUS CancelIrp(PIRP Irp)
-{
-    return CompleteIrp(Irp, STATUS_CANCELLED, 0);
 }
 
 NTSTATUS
@@ -223,9 +229,21 @@ SioctlCleanup(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp) {
     PAGED_CODE();
+    //PIRP                pendingIrp;
+    //PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+    //ASSERT(irpStack->FileObject != NULL);       //PVOID               fileContext;
+    //NTSTATUS            status;
     PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
 
-    CancelAllList(&pdata->irp_reversed_call_list_lock, &pdata->irp_reversed_call_list_head);
+
+    //pendingIrp = IoCsqRemoveNextIrp(&pdata->cancel_safe_queue, irpStack->FileObject);
+
+    //while (pendingIrp)
+    //{
+    //    CancelIrp(pendingIrp);
+    //    pendingIrp = IoCsqRemoveNextIrp(&pdata->cancel_safe_queue, irpStack->FileObject);
+    //}
+
     KeSetEvent(&pdata->termination_event, IO_NO_INCREMENT, FALSE);
 
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
@@ -264,46 +282,12 @@ SioctlDeviceControl(
     }
     else {
         IoMarkIrpPending(Irp);
-        ExInterlockedInsertTailList(&pdata->irp_reversed_call_list_head, &Irp->Tail.Overlay.ListEntry,
-            &pdata->irp_reversed_call_list_lock);
+        IoCsqInsertIrp(&pdata->cancel_safe_queue, Irp, NULL);
         return STATUS_PENDING;
     }
 
 }
 
-
-VOID
-CancelAllList(PKSPIN_LOCK lock, PLIST_ENTRY list_head) {
-    KIRQL old_irql;
-    KeAcquireSpinLock(lock, &old_irql);
-
-    while (!IsListEmpty(list_head)) {
-        PLIST_ENTRY entry = RemoveHeadList(list_head);
-        PIRP Irp = CONTAINING_RECORD(entry,
-            IRP,
-            Tail.
-            Overlay.
-            ListEntry);
-        CancelIrp(Irp);
-    }
-
-    KeReleaseSpinLock(lock, old_irql);
-}
-
-PIRP PopIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock) {
-    PLIST_ENTRY pListEntry = ExInterlockedRemoveHeadList(list_head, list_lock);
-    if (!pListEntry) {
-        return NULL;
-    }
-    else {
-        PIRP Irp = CONTAINING_RECORD(pListEntry,
-            IRP,
-            Tail.
-            Overlay.
-            ListEntry);
-        return Irp;
-    }
-}
 
 NTSTATUS processIrp(PIRP Irp) {
 
@@ -382,6 +366,107 @@ NTSTATUS processIrp(PIRP Irp) {
     Irp->IoStatus.Status = ntStatus;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return ntStatus;
+}
+
+
+_Use_decl_annotations_
+VOID
+CsqInsertIrp(
+    PIO_CSQ Csq,
+    PIRP  Irp
+)
+{
+    PDEVICE_EXT_DATA devExtension;
+    devExtension = CONTAINING_RECORD(Csq, DEVICE_EXT_DATA, cancel_safe_queue);
+    InsertTailList(&devExtension->pending_irp_queue, &Irp->Tail.Overlay.ListEntry);
+}
+
+_Use_decl_annotations_
+VOID
+CsqRemoveIrp(
+    PIO_CSQ  Csq,
+    PIRP  Irp
+)
+{
+    UNREFERENCED_PARAMETER(Csq);
+    RemoveEntryList(&Irp->Tail.Overlay.ListEntry);
+}
+
+_Use_decl_annotations_
+PIRP
+CsqPeekNextIrp(
+    PIO_CSQ  Csq,
+    PIRP  Irp,
+    PVOID  PeekContext
+)
+{
+    ASSERT(PeekContext == NULL);
+
+    PDEVICE_EXT_DATA        devExtension;
+    PIRP                    nextIrp;
+    PLIST_ENTRY             nextEntry;
+    PLIST_ENTRY             listHead;
+
+    devExtension = CONTAINING_RECORD(Csq,
+        DEVICE_EXT_DATA, cancel_safe_queue);
+
+    listHead = &devExtension->pending_irp_queue;
+
+
+    //If IRP is null start from the head
+    //Else start from the IRP
+    if (Irp == NULL) {
+        nextEntry = listHead->Flink;
+    }
+    else {
+        nextEntry = Irp->Tail.Overlay.ListEntry.Flink;
+    }
+
+    if (nextEntry != listHead) {
+        nextIrp = CONTAINING_RECORD(nextEntry, IRP, Tail.Overlay.ListEntry);
+    }
+    else {
+        nextIrp = NULL;
+    }
+
+    return nextIrp;
+}
+
+_Use_decl_annotations_
+VOID
+CsqAcquireLock(
+    PIO_CSQ  Csq,
+    PKIRQL  Irql
+)
+{
+    PDEVICE_EXT_DATA devExtension;
+    devExtension = CONTAINING_RECORD(Csq, DEVICE_EXT_DATA, cancel_safe_queue);
+    KeAcquireSpinLock(&devExtension->pending_irp_queue_lock, Irql);
+}
+
+_Use_decl_annotations_
+VOID
+CsqReleaseLock(
+    PIO_CSQ  Csq,
+    KIRQL  Irql
+)
+{
+    PDEVICE_EXT_DATA devExtension;
+    devExtension = CONTAINING_RECORD(Csq, DEVICE_EXT_DATA, cancel_safe_queue);
+    KeReleaseSpinLock(&devExtension->pending_irp_queue_lock, Irql);
+}
+
+_Use_decl_annotations_
+VOID
+CsqCompleteCanceledIrp(
+    _In_ PIO_CSQ  Csq,
+    _In_ PIRP  Irp
+)
+{
+    UNREFERENCED_PARAMETER(Csq);
+    Irp->IoStatus.Status = STATUS_CANCELLED;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
 }
 
 VOID

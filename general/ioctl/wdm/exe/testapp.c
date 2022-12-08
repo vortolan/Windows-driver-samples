@@ -225,38 +225,45 @@ main(
 
     //Wait for async IRP
     DWORD wait_result;
-    int index;
+    int index = 0;
     DWORD bytes_transferred;
 
     while (event_nb > 0) {
-        wait_result = WaitForMultipleObjects(event_nb, hEvents, FALSE, 5000);
+        wait_result = WaitForMultipleObjects(event_nb, hEvents, FALSE, 20000);
 
-        index = wait_result - STATUS_WAIT_0;
-        if (index < 0 || index > event_nb - 1) {
-            printf("Index out of range");
+        if (wait_result == WAIT_FAILED) {
+            printf("Wait failed...exiting !");
             break;
+        }
+        else if (wait_result == WAIT_TIMEOUT) {
+            printf("Wait timed out...exiting !");
+            break;
+        }
+        else if (wait_result >= WAIT_ABANDONED_0 && wait_result <= WAIT_ABANDONED_0 + event_nb - 1) {
+            printf("Wait abandonned...exiting !");
+            break;
+        }
+        else if (wait_result <= WAIT_OBJECT_0 + event_nb - 1) {
+            index = wait_result - WAIT_OBJECT_0;
         }
 
         if (GetOverlappedResult(hEvents[index], &overlapped_handles[index], &bytes_transferred, TRUE)) {
-            //Sucess
             printf("IRP Number %d complete\n", index + (IRP_NB - event_nb));
         }
         else {
             printf("IRP failed");
         }
 
-        //Reduce size of arrays
+        //Reduce size of array
         event_nb -= 1;
-        if (event_nb) {
+        if (event_nb > 0) {
             HANDLE* newhEvents = malloc(event_nb * sizeof(HANDLE));
             OVERLAPPED* new_overlapped_handles = malloc(event_nb * sizeof(OVERLAPPED));
-            int corrected_index = 0;
 
             for (int i = 0; i < event_nb + 1; ++i) {
                 if (i != index) {
-                    newhEvents[corrected_index] = hEvents[i];
-                    new_overlapped_handles[corrected_index] = overlapped_handles[i];
-                    ++corrected_index;
+                    newhEvents[i > index ? i - 1 : i] = hEvents[i];
+                    new_overlapped_handles[i > index ? i - 1 : i] = overlapped_handles[i];
                 }
                 else {
                     CloseHandle(hEvents[i]);
