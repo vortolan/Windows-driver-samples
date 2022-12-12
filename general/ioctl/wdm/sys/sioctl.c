@@ -78,8 +78,6 @@ PrintChars(
 
 void generate_reversed_calls(PVOID DriverObject);
 NTSTATUS CompleteIrp(PIRP Irp, NTSTATUS status, ULONG_PTR info);
-NTSTATUS CancelIrp(PIRP Irp);
-PIRP PopIrp(PLIST_ENTRY list_head, PKSPIN_LOCK list_lock);
 NTSTATUS processIrp(PIRP Irp);
 
 //CSQ Functions
