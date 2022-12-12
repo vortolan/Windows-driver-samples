@@ -74,9 +74,7 @@ main(
         errNum = GetLastError();
 
         if (errNum != ERROR_FILE_NOT_FOUND) {
-
             printf("CreateFile failed : %d\n", errNum);
-
             return ;
         }
 
@@ -124,6 +122,23 @@ main(
 
     }
     OVERLAPPED ovelapped_device_handle;
+    HANDLE* asyncEvent = CreateEvent(
+        NULL,    // default security attribute 
+        TRUE,    // manual-reset event 
+        FALSE,    // initial state = signaled 
+        NULL);   // unnamed event object 
+    
+    if (!asyncEvent)
+    {
+        printf("CreateEvent failed with %d.\n", GetLastError());
+        return;
+    }
+
+    //Map event to OVERLAPPED struct
+    ovelapped_device_handle.hEvent = asyncEvent;
+    ovelapped_device_handle.Offset = 0;
+    ovelapped_device_handle.OffsetHigh = 0;
+
     //Open async handle too
     if ((hAsyncDevice = CreateFile("\\\\.\\IoctlTest",
         GENERIC_READ | GENERIC_WRITE,
@@ -134,13 +149,8 @@ main(
         &ovelapped_device_handle)) == INVALID_HANDLE_VALUE) {
 
         errNum = GetLastError();
-
-        if (errNum != ERROR_FILE_NOT_FOUND) {
-
-            printf("CreateFile failed : %d\n", errNum);
-
-            return;
-        }
+        printf("CreateFile failed : %d\n", errNum);
+        return;
     }
 
     //
@@ -217,11 +227,9 @@ main(
     {
         printf("Error in DeviceIoControl : %d", GetLastError());
         return;
-
     }
     
     wprintf(L"OutBuffer (%d): %s\n", bytesReturned, (WCHAR*) OutputBuffer);
-
 
     //Wait for async IRP
     DWORD wait_result;
