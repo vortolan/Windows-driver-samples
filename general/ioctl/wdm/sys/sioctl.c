@@ -227,10 +227,7 @@ SioctlCleanup(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp) {
     PAGED_CODE();
-
-    PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
-    KeSetEvent(&pdata->termination_event, IO_NO_INCREMENT, FALSE);
-
+    UNREFERENCED_PARAMETER(DeviceObject);
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
@@ -239,9 +236,12 @@ SioctlUnloadDriver(
     _In_ PDRIVER_OBJECT DriverObject
     ) {
     PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject; 
+    PDEVICE_EXT_DATA pdata = deviceObject->DeviceExtension;
+
     UNICODE_STRING uniWin32NameString;
 
     PAGED_CODE();
+    KeSetEvent(&pdata->termination_event, IO_NO_INCREMENT, FALSE);
 
     RtlInitUnicodeString( &uniWin32NameString, DOS_DEVICE_NAME );
     IoDeleteSymbolicLink( &uniWin32NameString );

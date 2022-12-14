@@ -257,7 +257,7 @@ main(
 
     if (!bRc)
     {
-        fail("SeviceIoCOntrol query process list", NULL, TRUE);
+        fail("DeviceIoCOntrol query process list", NULL, TRUE);
     }
     
     PUNICODE_STRING buffer_ustr = (PUNICODE_STRING) OutputBuffer;
@@ -283,11 +283,11 @@ main(
             printf("Wait timed out...exiting (err: %i) !", GetLastError());
             break;
         }
-        else if (wait_result >= WAIT_ABANDONED_0 && wait_result <= WAIT_ABANDONED_0 + event_nb - 1) {
+        else if (wait_result >= WAIT_ABANDONED_0 && wait_result <= WAIT_ABANDONED_0 + IRP_NB - 1) {
             printf("Wait abandonned...exiting (err: %i)!", GetLastError());
             break;
         }
-        else if (wait_result <= WAIT_OBJECT_0 + event_nb - 1) {
+        else if (wait_result <= WAIT_OBJECT_0 + IRP_NB - 1) {
             index = wait_result - WAIT_OBJECT_0;
         }
 
@@ -295,12 +295,13 @@ main(
             printf("IRP Number %d complete\n", index + (IRP_NB - event_nb));
         }
         else {
-            printf("IRP failed");
+            printf("IRP failed %d \n", index + (IRP_NB - event_nb));
         }
 
         //Reduce size of array
         event_nb -= 1;
         if (event_nb > 0) {
+            printf("event nb: %i", event_nb);
             HANDLE* newhEvents = CHECK_MALLOC(malloc(event_nb * sizeof(HANDLE)));
             OVERLAPPED* new_overlapped_handles = CHECK_MALLOC(malloc(event_nb * sizeof(OVERLAPPED)));
 
@@ -308,11 +309,15 @@ main(
                 if (i != index) {
                     newhEvents[i > index ? i - 1 : i] = hEvents[i];
                     new_overlapped_handles[i > index ? i - 1 : i] = overlapped_handles[i];
+                    new_overlapped_handles[i > index ? i - 1 : i].hEvent = hEvents[i];
+                    printf("newEvents[%i] (%p) <- events[%i]\n", i > index ? i - 1 : i, newhEvents[i > index ? i - 1 : i], i);
                 }
                 else {
+                    printf("Closing handle %i (%p)\n", i, hEvents[0]);
                     CloseHandle(hEvents[i]);
                 }
             }
+            printf("\n");
 
             free(hEvents);
             free(overlapped_handles);
@@ -321,6 +326,7 @@ main(
             overlapped_handles = new_overlapped_handles;
         }
         else {
+            printf("Closing handle 0");
             CloseHandle(hEvents[0]);
             free(hEvents);
             free(overlapped_handles);
