@@ -299,7 +299,7 @@ main(
             index = wait_result - WAIT_OBJECT_0;
         }
 
-        if (GetOverlappedResult(hEvents[index], &overlapped_handles[index], &bytes_transferred, TRUE)) {
+        if (GetOverlappedResult(hEvents[index], &overlapped_handles[index+(IRP_NB - event_nb)], &bytes_transferred, TRUE)) {
             printf("IRP Number %d complete\n", index + (IRP_NB - event_nb));
         }
         else {
@@ -311,14 +311,14 @@ main(
         if (event_nb > 0) {
             printf("event nb: %i", event_nb);
             HANDLE* newhEvents = CHECK_MALLOC(malloc(event_nb * sizeof(HANDLE)));
-            OVERLAPPED* new_overlapped_handles = CHECK_MALLOC(malloc(event_nb * sizeof(OVERLAPPED)));
+            //OVERLAPPED* new_overlapped_handles = CHECK_MALLOC(malloc(event_nb * sizeof(OVERLAPPED)));
 
             for (int i = 0; i < event_nb + 1; ++i) {
                 corrected_index = i > index ? i - 1 : i;
                 if (i != index) {
                     newhEvents[corrected_index] = hEvents[i];
-                    new_overlapped_handles[corrected_index] = overlapped_handles[i];
-                    new_overlapped_handles[corrected_index].hEvent = newhEvents[corrected_index];
+                    //new_overlapped_handles[corrected_index] = overlapped_handles[i];
+                    //new_overlapped_handles[corrected_index].hEvent = newhEvents[corrected_index];
                     printf("newEvents[%i] (%p) <- events[%i]\n", corrected_index, newhEvents[corrected_index], i);
                 }
                 else {
@@ -331,10 +331,10 @@ main(
             //memset(overlapped_handles, 0, (event_nb + 1) * sizeof(OVERLAPPED));
 
             free(hEvents);
-            free(overlapped_handles);
+            //free(overlapped_handles);
 
             hEvents = newhEvents;
-            overlapped_handles = new_overlapped_handles;
+            //overlapped_handles = new_overlapped_handles;
         }
         else {
             printf("Closing handle 0 (%p)", hEvents[0]);
