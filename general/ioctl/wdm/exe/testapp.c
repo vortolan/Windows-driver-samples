@@ -23,7 +23,42 @@ Environment:
 
 #include <conio.h>
 
-#define IRP_NB 10
+
+#define IRP_NB 12
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING, * PUNICODE_STRING;
+
+void fail(const char* failure_location, const char* reason, BOOL wait) {
+    if (!reason) {
+        printf("%s failed with error %d", failure_location, GetLastError());
+    }
+    else {
+        printf("%s failed (%s)", failure_location, reason);
+    }
+
+    if (wait) {
+        _getch();
+    }
+    exit(255);
+}
+
+void* check_malloc(void* malloc_result, int line) {
+    if (malloc_result) {
+        return malloc_result;
+    }
+    else {
+        printf("Malloc call line %i failed", line);
+        _getch();
+        exit(255);
+    }
+}
+
+#define CHECK_MALLOC(res) check_malloc((res), __LINE__)
+
 
 
 BOOLEAN
@@ -39,7 +74,7 @@ SetupDriverName(
     _In_ ULONG BufferLength
     );
 
-char OutputBuffer[16 * 1024];
+wchar_t OutputBuffer[8 * 1024];
 char InputBuffer[1024];
 
 VOID __cdecl
@@ -59,6 +94,9 @@ main(
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
 
+    //Disable buffering on stdout
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     //
     // open the device
     //
@@ -74,8 +112,7 @@ main(
         errNum = GetLastError();
 
         if (errNum != ERROR_FILE_NOT_FOUND) {
-            printf("CreateFile failed : %d\n", errNum);
-            return ;
+            fail("CreateFile", "File not found", TRUE);
         }
 
         //
@@ -84,8 +121,7 @@ main(
         //
 
         if (!SetupDriverName(driverLocation, sizeof(driverLocation))) {
-
-            return ;
+            fail("Setup Driver Name", "driver not yet installed", FALSE);
         }
 
         if (!ManageDriver(DRIVER_NAME,
@@ -116,8 +152,7 @@ main(
                             NULL);
 
         if ( hSyncDevice == INVALID_HANDLE_VALUE ){
-            printf ( "Error: CreatFile Failed : %d\n", GetLastError());
-            return;
+            fail("Create Sync Device", NULL, TRUE);
         }
 
     }
@@ -130,8 +165,7 @@ main(
     
     if (!asyncEvent)
     {
-        printf("CreateEvent failed with %d.\n", GetLastError());
-        return;
+        fail("Create Async Event", NULL, TRUE);
     }
 
     //Map event to OVERLAPPED struct
@@ -147,10 +181,7 @@ main(
         CREATE_ALWAYS,
         FILE_FLAG_OVERLAPPED,
         &ovelapped_device_handle)) == INVALID_HANDLE_VALUE) {
-
-        errNum = GetLastError();
-        printf("CreateFile failed : %d\n", errNum);
-        return;
+        fail("Ceate Async Device", NULL, TRUE);
     }
 
     //
@@ -166,8 +197,8 @@ main(
     //OVERLAPPED
     //THEN wait for multiple objects on the OVERLAPPED structs
     int event_nb = IRP_NB;
-    HANDLE* hEvents = malloc(event_nb * sizeof(HANDLE));
-    OVERLAPPED* overlapped_handles = malloc(event_nb * sizeof(OVERLAPPED));
+    HANDLE* hEvents = CHECK_MALLOC(malloc(IRP_NB * sizeof(HANDLE)));
+    OVERLAPPED* overlapped_handles = CHECK_MALLOC(malloc(IRP_NB * sizeof(OVERLAPPED)));
 
     for (int i = 0; i < IRP_NB; ++i) {
         //Create event
@@ -179,8 +210,9 @@ main(
 
         if (hEvents[i] == NULL)
         {
-            printf("CreateEvent failed with %d.\n", GetLastError());
-            return;
+            char buff[2];
+            _itoa_s(i, buff, 2, 10);
+            fail("Create Event for inverted call", buff, TRUE);
         }
 
         //Map event to OVERLAPPED struct
@@ -225,11 +257,15 @@ main(
 
     if (!bRc)
     {
-        printf("Error in DeviceIoControl : %d", GetLastError());
-        return;
+        fail("SeviceIoCOntrol query process list", NULL, TRUE);
     }
     
-    wprintf(L"OutBuffer (%d): %s\n", bytesReturned, (WCHAR*) OutputBuffer);
+    PUNICODE_STRING buffer_ustr = (PUNICODE_STRING) OutputBuffer;
+    WCHAR* buffer_ucontent = (WCHAR*)((char*)OutputBuffer + sizeof(UNICODE_STRING));
+    wprintf(L"Outbuffer: ");
+    int characters_written = wprintf(L"%s", buffer_ucontent);
+    wprintf(L"\n");
+    wprintf(L"%i characters written (expected: %i)\n", characters_written, buffer_ustr->Length / 2); //because length is in bytes for UNICODE_STRING
 
     //Wait for async IRP
     DWORD wait_result;
@@ -240,15 +276,15 @@ main(
         wait_result = WaitForMultipleObjects(event_nb, hEvents, FALSE, 20000);
 
         if (wait_result == WAIT_FAILED) {
-            printf("Wait failed...exiting !");
+            printf("Wait failed...exiting (err: %i)!", GetLastError());
             break;
         }
         else if (wait_result == WAIT_TIMEOUT) {
-            printf("Wait timed out...exiting !");
+            printf("Wait timed out...exiting (err: %i) !", GetLastError());
             break;
         }
         else if (wait_result >= WAIT_ABANDONED_0 && wait_result <= WAIT_ABANDONED_0 + event_nb - 1) {
-            printf("Wait abandonned...exiting !");
+            printf("Wait abandonned...exiting (err: %i)!", GetLastError());
             break;
         }
         else if (wait_result <= WAIT_OBJECT_0 + event_nb - 1) {
@@ -265,8 +301,8 @@ main(
         //Reduce size of array
         event_nb -= 1;
         if (event_nb > 0) {
-            HANDLE* newhEvents = malloc(event_nb * sizeof(HANDLE));
-            OVERLAPPED* new_overlapped_handles = malloc(event_nb * sizeof(OVERLAPPED));
+            HANDLE* newhEvents = CHECK_MALLOC(malloc(event_nb * sizeof(HANDLE)));
+            OVERLAPPED* new_overlapped_handles = CHECK_MALLOC(malloc(event_nb * sizeof(OVERLAPPED)));
 
             for (int i = 0; i < event_nb + 1; ++i) {
                 if (i != index) {
@@ -298,10 +334,10 @@ main(
     CloseHandle(hAsyncDevice);
     CloseHandle(hSyncDevice);
 
-    ManageDriver(DRIVER_NAME,
-                 driverLocation,
-                 DRIVER_FUNC_REMOVE
-                 );
+    //ManageDriver(DRIVER_NAME,
+    //             driverLocation,
+    //             DRIVER_FUNC_REMOVE
+    //             );
 
     _getch();
 

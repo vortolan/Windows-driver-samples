@@ -227,21 +227,8 @@ SioctlCleanup(
     PDEVICE_OBJECT DeviceObject,
     PIRP Irp) {
     PAGED_CODE();
-    //PIRP                pendingIrp;
-    //PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
-    //ASSERT(irpStack->FileObject != NULL);       //PVOID               fileContext;
-    //NTSTATUS            status;
+
     PDEVICE_EXT_DATA pdata = DeviceObject->DeviceExtension;
-
-
-    //pendingIrp = IoCsqRemoveNextIrp(&pdata->cancel_safe_queue, irpStack->FileObject);
-
-    //while (pendingIrp)
-    //{
-    //    CancelIrp(pendingIrp);
-    //    pendingIrp = IoCsqRemoveNextIrp(&pdata->cancel_safe_queue, irpStack->FileObject);
-    //}
-
     KeSetEvent(&pdata->termination_event, IO_NO_INCREMENT, FALSE);
 
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
@@ -316,16 +303,13 @@ NTSTATUS processIrp(PIRP Irp) {
 
         //Allocate buffer to store process names
         USHORT PROCESS_NAMES_SIZE = 1024 * 16;
-        UNICODE_STRING processes_names = { 0 };
-        processes_names.Length = 0;
-        processes_names.Buffer = (PWCHAR)ExAllocatePool2(POOL_FLAG_PAGED, PROCESS_NAMES_SIZE, '9gaT');
-        processes_names.MaximumLength = PROCESS_NAMES_SIZE;
+        PUNICODE_STRING processes_names = (PUNICODE_STRING) outBuf;
+        processes_names->Length = 0;
+        processes_names->Buffer = (PWCHAR)(outBuf + sizeof(UNICODE_STRING));
+        processes_names->MaximumLength = PROCESS_NAMES_SIZE;
 
         UNICODE_STRING comma;
         RtlInitUnicodeString(&comma, L",");
-
-        UNICODE_STRING nullstr;
-        RtlInitUnicodeString(&nullstr, L"\0");
 
         //Perform actual query
         int SPI_BUFFER_SIZE = 1 * 1024 * 1024;
@@ -333,25 +317,19 @@ NTSTATUS processIrp(PIRP Irp) {
         if (spi_buffer) {
             PSYSTEM_PROCESS_INFORMATION pspi = (PSYSTEM_PROCESS_INFORMATION)spi_buffer;
             if (NT_SUCCESS(ZwQuerySystemInformation(SystemProcessInformation, pspi, SPI_BUFFER_SIZE, NULL))) {
-
                 while (pspi->NextEntryOffset) {
                     if (pspi->ImageName.Length) {
-                        RtlAppendUnicodeStringToString(&processes_names, &pspi->ImageName);
-                        RtlAppendUnicodeStringToString(&processes_names, &comma);
+                        RtlAppendUnicodeStringToString(processes_names, &pspi->ImageName);
+                        RtlAppendUnicodeStringToString(processes_names, &comma);
                     }
                     pspi = (PSYSTEM_PROCESS_INFORMATION)((PUCHAR)pspi + pspi->NextEntryOffset);
                 }
 
-                //Copy data to out buffer and print
-                RtlAppendUnicodeStringToString(&processes_names, &nullstr);
-                RtlCopyMemory(outBuf, processes_names.Buffer, processes_names.Length * sizeof(WCHAR));
-
                 //Free memory
                 ExFreePoolWithTag(spi_buffer, '9gaT');
-                ExFreePoolWithTag(processes_names.Buffer, '9gaT');
 
-                Irp->IoStatus.Information = processes_names.Length < outBufLength ?
-                    processes_names.Length : outBufLength;
+                Irp->IoStatus.Information = processes_names->Length + sizeof(UNICODE_STRING) < outBufLength ?
+                    processes_names->Length + sizeof(UNICODE_STRING) : outBufLength;
             }
         }
     }
