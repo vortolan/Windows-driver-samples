@@ -196,7 +196,7 @@ main(
     //Send a lot of IRP inverted call
     //OVERLAPPED
     //THEN wait for multiple objects on the OVERLAPPED structs
-    int event_nb = IRP_NB;
+    int event_remaining = IRP_NB;
     HANDLE* hEvents = CHECK_MALLOC(malloc(IRP_NB * sizeof(HANDLE)));
     OVERLAPPED* overlapped_handles = CHECK_MALLOC(malloc(IRP_NB * sizeof(OVERLAPPED)));
 
@@ -272,8 +272,8 @@ main(
     int index = 0;
     DWORD bytes_transferred;
 
-    while (event_nb > 0) {
-        wait_result = WaitForMultipleObjects(event_nb, hEvents, FALSE, 20000);
+    while (event_remaining > 0) {
+        wait_result = WaitForMultipleObjects(IRP_NB, hEvents, FALSE, 20000);
 
         if (wait_result == WAIT_FAILED) {
             printf("Wait failed...exiting (err: %i)!", GetLastError());
@@ -283,48 +283,27 @@ main(
             printf("Wait timed out...exiting (err: %i) !", GetLastError());
             break;
         }
-        else if (wait_result >= WAIT_ABANDONED_0 && wait_result <= WAIT_ABANDONED_0 + event_nb - 1) {
+        else if (wait_result >= WAIT_ABANDONED_0 && wait_result <= WAIT_ABANDONED_0 + IRP_NB - 1) {
             printf("Wait abandonned...exiting (err: %i)!", GetLastError());
             break;
         }
-        else if (wait_result <= WAIT_OBJECT_0 + event_nb - 1) {
+        else if (wait_result <= WAIT_OBJECT_0 + IRP_NB - 1) {
             index = wait_result - WAIT_OBJECT_0;
         }
 
         if (GetOverlappedResult(hEvents[index], &overlapped_handles[index], &bytes_transferred, TRUE)) {
-            printf("IRP Number %d complete\n", index + (IRP_NB - event_nb));
+            printf("IRP Number %d complete\n", index);
         }
         else {
-            printf("IRP failed");
+            printf("IRP failed  %d\n", index);
         }
 
-        //Reduce size of array
-        event_nb -= 1;
-        if (event_nb > 0) {
-            HANDLE* newhEvents = CHECK_MALLOC(malloc(event_nb * sizeof(HANDLE)));
-            OVERLAPPED* new_overlapped_handles = CHECK_MALLOC(malloc(event_nb * sizeof(OVERLAPPED)));
-
-            for (int i = 0; i < event_nb + 1; ++i) {
-                if (i != index) {
-                    newhEvents[i > index ? i - 1 : i] = hEvents[i];
-                    new_overlapped_handles[i > index ? i - 1 : i] = overlapped_handles[i];
-                }
-                else {
-                    CloseHandle(hEvents[i]);
-                }
-            }
-
-            free(hEvents);
-            free(overlapped_handles);
-
-            hEvents = newhEvents;
-            overlapped_handles = new_overlapped_handles;
+        printf("Resetting event n %i\n", index);
+        if (!ResetEvent(hEvents[index])) {
+            fail("Reset Event", NULL, TRUE);
         }
-        else {
-            CloseHandle(hEvents[0]);
-            free(hEvents);
-            free(overlapped_handles);
-        }
+        event_remaining -= 1;
+
     }
 
     //
