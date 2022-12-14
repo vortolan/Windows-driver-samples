@@ -157,7 +157,7 @@ main(
 
     }
     OVERLAPPED ovelapped_device_handle;
-    HANDLE* asyncEvent = CreateEvent(
+    HANDLE asyncEvent = CreateEvent(
         NULL,    // default security attribute 
         TRUE,    // manual-reset event 
         FALSE,    // initial state = signaled 
@@ -270,9 +270,17 @@ main(
     //Wait for async IRP
     DWORD wait_result;
     int index = 0;
+    int corrected_index;
     DWORD bytes_transferred;
 
     while (event_nb > 0) {
+
+        for (int i = 0; i < event_nb; ++i) {
+            if (hEvents[i] == NULL) {
+               DebugBreak();
+            }
+        }
+
         wait_result = WaitForMultipleObjects(event_nb, hEvents, FALSE, 20000);
 
         if (wait_result == WAIT_FAILED) {
@@ -306,11 +314,12 @@ main(
             OVERLAPPED* new_overlapped_handles = CHECK_MALLOC(malloc(event_nb * sizeof(OVERLAPPED)));
 
             for (int i = 0; i < event_nb + 1; ++i) {
+                corrected_index = i > index ? i - 1 : i;
                 if (i != index) {
-                    newhEvents[i > index ? i - 1 : i] = hEvents[i];
-                    new_overlapped_handles[i > index ? i - 1 : i] = overlapped_handles[i];
-                    new_overlapped_handles[i > index ? i - 1 : i].hEvent = hEvents[i];
-                    printf("newEvents[%i] (%p) <- events[%i]\n", i > index ? i - 1 : i, newhEvents[i > index ? i - 1 : i], i);
+                    newhEvents[corrected_index] = hEvents[i];
+                    new_overlapped_handles[corrected_index] = overlapped_handles[i];
+                    new_overlapped_handles[corrected_index].hEvent = newhEvents[corrected_index];
+                    printf("newEvents[%i] (%p) <- events[%i]\n", corrected_index, newhEvents[corrected_index], i);
                 }
                 else {
                     printf("Closing handle %i (%p)\n", i, hEvents[0]);
@@ -318,6 +327,8 @@ main(
                 }
             }
             printf("\n");
+            //memset(hEvents, 0, (event_nb + 1) * sizeof(HANDLE));
+            //memset(overlapped_handles, 0, (event_nb + 1) * sizeof(OVERLAPPED));
 
             free(hEvents);
             free(overlapped_handles);
@@ -326,7 +337,7 @@ main(
             overlapped_handles = new_overlapped_handles;
         }
         else {
-            printf("Closing handle 0");
+            printf("Closing handle 0 (%p)", hEvents[0]);
             CloseHandle(hEvents[0]);
             free(hEvents);
             free(overlapped_handles);
